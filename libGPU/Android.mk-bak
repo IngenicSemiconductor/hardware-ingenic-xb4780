@@ -1,0 +1,79 @@
+LOCAL_PATH := $(call my-dir)
+
+ifeq ($(strip $(TARGET_BOARD_PLATFORM_GPU)), SGX540)
+
+file := $(TARGET_OUT)/lib/libglslcompiler.so
+$(file) : $(LOCAL_PATH)/libglslcompiler.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/libIMGegl.so
+$(file) : $(LOCAL_PATH)/libIMGegl.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/libpvr2d.so
+$(file) : $(LOCAL_PATH)/libpvr2d.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/libpvrANDROID_WSEGL.so
+$(file) : $(LOCAL_PATH)/libpvrANDROID_WSEGL.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/libPVRScopeServices.so
+$(file) : $(LOCAL_PATH)/libPVRScopeServices.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/libsrv_init.so
+$(file) : $(LOCAL_PATH)/libsrv_init.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/libsrv_um.so
+$(file) : $(LOCAL_PATH)/libsrv_um.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/hw/gralloc.xb4780.so
+$(file) : $(LOCAL_PATH)/hw/gralloc.xxx.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/egl/libEGL_POWERVR_SGX540_130.so
+$(file) : $(LOCAL_PATH)/egl/libEGL_POWERVR_SGX540_130.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/egl/libGLESv1_CM_POWERVR_SGX540_130.so
+$(file) : $(LOCAL_PATH)/egl/libGLESv1_CM_POWERVR_SGX540_130.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/lib/egl/libGLESv2_POWERVR_SGX540_130.so
+$(file) : $(LOCAL_PATH)/egl/libGLESv2_POWERVR_SGX540_130.so | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+file := $(TARGET_OUT)/bin/pvrsrvctl
+$(file) : $(LOCAL_PATH)/pvrsrvctl | $(ACP)
+	$(transform-prebuilt-to-target)
+ALL_PREBUILT += $(file)
+$(INSTALLED_SYSTEMIMAGE): $(file)
+
+#BOARD_EGL_CFG := $(LOCAL_PATH)/egl/egl.cfg
+
+endif
