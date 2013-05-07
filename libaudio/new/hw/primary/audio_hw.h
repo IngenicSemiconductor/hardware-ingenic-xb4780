@@ -5,7 +5,9 @@
  **/
 
 #define DSP_DEVICE	"/dev/snd/dsp"
+#define DSP1_DEVICE	"/dev/snd/dsp1"
 #define MIXER_DEVICE	"/dev/snd/mixer"
+
 
 
 /**
@@ -32,14 +34,16 @@ enum snd_device_t {
 	SND_DEVICE_HEADSET_MIC,
 	SND_DEVICE_HDMI = 15,	//fix for mid pretest
 
-	SND_DEVICE_HEADPHONE_DOWNLINK,
-	SND_DEVICE_HEADSET_DOWNLINK,
-	SND_DEVICE_HANDSET_DOWNLINK,
-	SND_DEVICE_SPEAKER_DOWNLINK,
-	SND_DEVICE_BUILDIN_MIC_UPLINK,
-	SND_DEVICE_HEADSET_MIC_UPLINK,
+	SND_DEVICE_LOOP_TEST = 16,
 
-	SND_DEVICE_RECORD_INCALL,
+	SND_DEVICE_CALL_START,							//call route start mark
+	SND_DEVICE_CALL_HEADPHONE = SND_DEVICE_CALL_START,
+	SND_DEVICE_CALL_HEADSET,
+	SND_DEVICE_CALL_HANDSET,
+	SND_DEVICE_CALL_SPEAKER,
+	SND_DEVICE_HEADSET_RECORD_INCALL,
+	SND_DEVICE_BUILDIN_RECORD_INCALL,
+	SND_DEVICE_CALL_END = SND_DEVICE_BUILDIN_RECORD_INCALL,	//call route end mark
 
 	SND_DEVICE_COUNT
 };
@@ -50,6 +54,7 @@ struct snd_device_config {
 	uint32_t mic_mute;
 };
 
+#define SNDCTL_EXT_SET_BUFFSIZE				_SIOR ('P', 100, int)
 #define SNDCTL_EXT_SET_DEVICE               _SIOR ('P', 99, int)
 #define SNDCTL_EXT_SET_STANDBY              _SIOR ('P', 98, int)
 #define SNDCTL_EXT_START_BYPASS_TRANS       _SIOW ('P', 97, struct spipe_info)
@@ -58,19 +63,20 @@ struct snd_device_config {
 #define SNDCTL_EXT_DIRECT_PUTINODE          _SIOW ('P', 94, struct direct_info)
 #define SNDCTL_EXT_DIRECT_GETONODE          _SIOR ('P', 93, struct direct_info)
 #define SNDCTL_EXT_DIRECT_PUTONODE          _SIOW ('P', 92, struct direct_info)
-
+#define SNDCTL_EXT_STOP_DMA					_SIOW ('P', 91, int)
+#define SNDCTL_EXT_SET_REPLAY_VOLUME        _SIOR ('P', 90, int)
 #define SND_MUTE_UNMUTED        0
 #define SND_MUTE_MUTED          1
 /*###################################################*/
 
 #define AUDIO_HW_OUT_DEF_SAMPLERATE	44100
 #define AUDIO_HW_OUT_DEF_CHANNELS	AUDIO_CHANNEL_OUT_STEREO
-#define AUDIO_HW_OUT_DEF_BUFFERSIZE	4096
+#define AUDIO_HW_OUT_DEF_BUFFERSIZE	4096 //(fix)  64 * N audio_mixer needed
 #define AUDIO_HW_OUT_DEF_FORMAT	    AUDIO_FORMAT_PCM_16_BIT
 
 #define AUDIO_HW_IN_DEF_SAMPLERATE	8000
 #define AUDIO_HW_IN_DEF_CHANNELS	AUDIO_CHANNEL_IN_MONO
-#define AUDIO_HW_IN_DEF_BUFFERSIZE	4096
+#define AUDIO_HW_IN_DEF_BUFFERSIZE	4096 //(fix)
 #define AUDIO_HW_IN_DEF_FORMAT		AUDIO_FORMAT_PCM_16_BIT
 
 /*###################################################*/
@@ -101,12 +107,14 @@ struct steam_in_state {
 
 struct device_state {
 	int adevMode;
+	bool btMode;
 	bool micMute;
 	bool earMute;
 };
 
 struct device_prope {
 	int dev_fd;
+	int btdev_fd;
 	int dev_map_fd;
 	unsigned char *dev_mapdata_start;
 };
@@ -133,4 +141,5 @@ struct xb47xx_audio_device {
 	struct xb47xx_stream_in	*istream;
 	struct xb47xx_stream_out *ostream;
 };
+
 /*###################################################*/

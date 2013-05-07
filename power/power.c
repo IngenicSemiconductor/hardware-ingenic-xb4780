@@ -48,12 +48,10 @@ static void sysfs_write(char *path, char *s)
 
 static void power_init(struct power_module *module)
 {
-    sysfs_write("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-                "interactive");
     sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
                 "20000");
     sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time",
-                "80000");
+                "100000");
     sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load",
                 "85");
     sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",

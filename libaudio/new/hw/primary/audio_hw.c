@@ -23,9 +23,10 @@ static int debug_output_fd;
 static int debug_input_fd;
 #define DUMP_INPUT_FILE "/data/dump_input.pcm"
 #define DUMP_OUTPUT_FILE "/data/dump_output.pcm"
+#define AUDIO_ALLOW_RECORD_CHANGE_BUFFERSIZE 1
 
-#define FUNC_ENTER() //ALOGD("[FUNC TRACE] %s: %d ----\n", __FUNCTION__, __LINE__)
-#define FUNC_LEAVE() //ALOGV("[FUNC TRACE] %s: %d ----\n", __FUNCTION__, __LINE__)
+#define FUNC_ENTER() ALOGV("[FUNC TRACE] %s: %d ----\n", __FUNCTION__, __LINE__)
+#define FUNC_LEAVE() ALOGV("[FUNC TRACE] %s: %d ----\n", __FUNCTION__, __LINE__)
 
 #include <errno.h>
 #include <pthread.h>
@@ -42,9 +43,9 @@ static int debug_input_fd;
 #include <math.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <linux/llist.h>
 #include <linux/soundcard.h>
 #include "audio_hw.h"
-
 
 /*device operation function*/
 
@@ -60,18 +61,19 @@ static int set_device_format(int fd , audio_format_t *format)
 
 	if (fd <= 0)
 		return -ENODEV;
+
 	switch (*format) {
-	case AUDIO_FORMAT_PCM_16_BIT:
-		format_dev = AFMT_S16_LE;
-		break;
-	case AUDIO_FORMAT_PCM_8_BIT:
-		format_dev = AFMT_U8;
-		break;
-	default:
-		ALOGW("set format is unsupport %x set as defalut %x.\n",*format,AUDIO_FORMAT_PCM_16_BIT);
-		*format =  AUDIO_FORMAT_PCM_16_BIT;
-		format_dev = AFMT_S16_LE;
-		break;
+		case AUDIO_FORMAT_PCM_16_BIT:
+			format_dev = AFMT_S16_LE;
+			break;
+		case AUDIO_FORMAT_PCM_8_BIT:
+			format_dev = AFMT_U8;
+			break;
+		default:
+			ALOGW("set format is unsupport %x set as defalut %x.\n",*format,AUDIO_FORMAT_PCM_16_BIT);
+			*format =  AUDIO_FORMAT_PCM_16_BIT;
+			format_dev = AFMT_S16_LE;
+			break;
 	}
 
 	ret = ioctl(fd,SNDCTL_DSP_SETFMT,&format_dev);
@@ -93,7 +95,6 @@ static int set_device_samplerate(int fd,uint32_t* samplerate)
 
 	return ret;
 }
-
 
 static int set_device_channels(int fd, audio_channel_mask_t *channel_mask, enum direction dir)
 {
@@ -121,24 +122,50 @@ static int set_device_channels(int fd, audio_channel_mask_t *channel_mask, enum 
 	return ret;
 }
 
+static int reset_device_buffersize(int fd,uint32_t samplerate)
+{
+	int channel_count = 0;
+	int buffersize = 0;
+	int ret = 0;
+#if AUDIO_ALLOW_RECORD_CHANGE_BUFFERSIZE
+	ALOGV("reset device bufferSize samplerate = %d",samplerate);
+	if (fd < 0)
+		return AUDIO_HW_IN_DEF_BUFFERSIZE;
+
+	if ( samplerate >= 6000 &&samplerate <= 8000)
+		buffersize = 1024;
+	else if (samplerate > 8000 && samplerate <= 16000)
+		buffersize = 2048;
+	else
+		buffersize = 4096;
+	ret = ioctl(fd,SNDCTL_EXT_SET_BUFFSIZE,&buffersize);
+	if (ret)
+		return AUDIO_HW_IN_DEF_BUFFERSIZE;
+	else
+		return buffersize;
+#else
+	return AUDIO_HW_IN_DEF_BUFFERSIZE;
+#endif
+}
+
 static bool isInCall(struct xb47xx_audio_device *ladev)
 {
 	if (ladev == NULL)
 		return false;
 
-	if (ladev->dState.adevMode == AUDIO_MODE_IN_CALL ||
-			ladev->dState.adevMode == AUDIO_MODE_IN_COMMUNICATION) {
+	if (ladev->dState.adevMode == AUDIO_MODE_IN_CALL) {
+		ALOGV("isInCall\n");
 		return true;
 	}
 
 	return false;
 }
 /* #################################################################### *\
-|* struct audio_stream_out
-\* #################################################################### */
+   |* struct audio_stream_out
+   \* #################################################################### */
 /***************************\
  * struct audio_stream
-\***************************/
+ \***************************/
 /**
  * sampling rate is in Hz - eg. 44100
  */
@@ -249,7 +276,6 @@ static int out_set_format(struct audio_stream *stream, audio_format_t format)
 	} else
 		ALOGW("%s(line:%d): set out format error no device", __func__, __LINE__);
 
-
 	return ret;
 }
 
@@ -326,6 +352,375 @@ static audio_devices_t out_get_device(const struct audio_stream *stream)
 	return out->outState.sState.devices;
 }
 
+#define AD_STREAM_MEMSIZ    (3 * (AD_NODE_BUFSIZ))
+#define AD_NODE_BUFSIZ      (1024)
+
+typedef struct {
+	struct list_head list;
+	unsigned int size;
+	char *addr;
+} ADnode;
+
+typedef struct {
+	struct list_head    free_node_list;
+	struct list_head    use_node_list;
+	ADnode node[3];
+	int free_cnt;
+	int use_cnt;
+	char *mem;
+	pthread_mutex_t     slock;
+} ADstream;
+ADstream bt_dstream, bt_ustream;
+
+pthread_cond_t dstream_rdy_sig = PTHREAD_COND_INITIALIZER;
+pthread_cond_t ustream_rdy_sig = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t dstream_rdy_lock;
+pthread_mutex_t ustream_rdy_lock;
+
+struct bt_context {
+	pthread_t dr_thread;
+	pthread_t dw_thread;
+	pthread_t ur_thread;
+	pthread_t uw_thread;
+} bt_dev;
+
+static ADnode *get_free_node(ADstream *stream)
+{
+	struct list_head *phead = &stream->free_node_list;
+        ADnode *node = NULL;
+
+        pthread_mutex_lock(&stream->slock);
+        if (list_empty(phead)) {
+                pthread_mutex_unlock(&stream->slock);
+                return NULL;
+        }
+
+        node = list_entry(phead->next, ADnode, list);
+        list_del(phead->next);
+	stream->free_cnt--;
+        pthread_mutex_unlock(&stream->slock);
+
+        return node;
+}
+
+static void put_free_node(ADstream *stream, ADnode *node)
+{
+	struct list_head *phead = &stream->free_node_list;
+
+	pthread_mutex_lock(&stream->slock);
+	node->size = 0;
+	list_add_tail(&node->list, phead);
+	stream->free_cnt++;
+	pthread_mutex_unlock(&stream->slock);
+}
+
+static void put_use_node(ADstream *stream, ADnode *node, int size)
+{
+	struct list_head *phead = &stream->use_node_list;
+
+	pthread_mutex_lock(&stream->slock);
+	node->size = size;
+	list_add_tail(&node->list, phead);
+	stream->use_cnt++;
+	pthread_mutex_unlock(&stream->slock);
+}
+
+static ADnode *get_use_node(ADstream *stream)
+{
+	struct list_head *phead = &stream->use_node_list;
+        ADnode *node = NULL;
+
+        pthread_mutex_lock(&stream->slock);
+        if (list_empty(phead)) {
+                pthread_mutex_unlock(&stream->slock);
+                return NULL;
+        }
+
+        node = list_entry(phead->next, ADnode, list);
+        list_del(phead->next);
+	stream->use_cnt--;
+        pthread_mutex_unlock(&stream->slock);
+
+        return node;
+}
+
+static inline int
+get_node_cnt_bylist(ADstream *stream, struct list_head *phead)
+{
+    ADnode *tmp = NULL;
+    int cnt = 0;
+
+    pthread_mutex_lock(&stream->slock);
+    list_for_each_entry(tmp, phead, list)
+        cnt++;
+    pthread_mutex_unlock(&stream->slock);
+
+    return cnt;
+}
+
+static int get_free_node_cnt(ADstream *stream)
+{
+	return get_node_cnt_bylist(stream, &stream->free_node_list);
+}
+
+static int get_use_node_cnt(ADstream *stream)
+{
+	return get_node_cnt_bylist(stream, &stream->use_node_list);
+}
+
+static void *dr_thread_func(void *_dev)
+{
+	struct xb47xx_audio_device *ladev = _dev;
+	ADnode *node = NULL;
+	int size = 0;
+
+	if (ladev->iDevPrope.dev_fd <= 0)
+		return NULL;
+
+	while (ladev->dState.btMode) {
+		node = get_free_node(&bt_dstream);
+		if (node != NULL) {
+			size = read(ladev->iDevPrope.dev_fd, node->addr, AD_NODE_BUFSIZ);
+			if (size > 0) {
+		                put_use_node(&bt_dstream, node, size);
+				size = 0;
+				if (bt_dstream.use_cnt == 1)
+					pthread_cond_signal(&dstream_rdy_sig);
+			}
+		} else {
+			pthread_mutex_lock(&dstream_rdy_lock);
+			if (bt_dstream.free_cnt <= 0)
+				pthread_cond_wait(&dstream_rdy_sig,&dstream_rdy_lock);
+			pthread_mutex_unlock(&dstream_rdy_lock);
+		}
+	}
+
+	return NULL;
+}
+
+static void *dw_thread_func(void *_dev)
+{
+	struct xb47xx_audio_device *ladev = _dev;
+	ADnode *node = NULL;
+
+	if (ladev->oDevPrope.btdev_fd <= 0)
+		return NULL;
+
+	while (ladev->dState.btMode) {
+		node = get_use_node(&bt_dstream);
+		if (node != NULL) {
+			write(ladev->oDevPrope.btdev_fd, node->addr, node->size);
+			put_free_node(&bt_dstream, node);
+			if (bt_dstream.free_cnt == 1)
+				pthread_cond_signal(&dstream_rdy_sig);
+		} else {
+			pthread_mutex_lock(&dstream_rdy_lock);
+			if (bt_dstream.use_cnt <= 0)
+				pthread_cond_wait(&dstream_rdy_sig,&dstream_rdy_lock);
+			pthread_mutex_unlock(&dstream_rdy_lock);
+		}
+	}
+
+	return NULL;
+}
+
+static void *ur_thread_func(void *_dev)
+{
+	struct xb47xx_audio_device *ladev = _dev;
+	ADnode *node = NULL;
+	int size = 0;
+
+	if (ladev->iDevPrope.btdev_fd <= 0)
+		return NULL;
+
+	while (ladev->dState.btMode) {
+		node = get_free_node(&bt_ustream);
+		if (node != NULL) {
+			size = read(ladev->iDevPrope.btdev_fd, node->addr, AD_NODE_BUFSIZ);
+			if (size > 0) {
+				put_use_node(&bt_ustream, node, size);
+				size = 0;
+				if (bt_ustream.use_cnt == 1)
+					pthread_cond_signal(&ustream_rdy_sig);
+			}
+		} else {
+			pthread_mutex_lock(&ustream_rdy_lock);
+			if (bt_ustream.free_cnt <= 0)
+				pthread_cond_wait(&ustream_rdy_sig, &ustream_rdy_lock);
+			pthread_mutex_unlock(&ustream_rdy_lock);
+		}
+	}
+
+	return NULL;
+}
+
+static void *uw_thread_func(void *_dev)
+{
+	struct xb47xx_audio_device *ladev = _dev;
+	ADnode *node = NULL;
+
+	if (ladev->oDevPrope.dev_fd <= 0)
+		return NULL;
+
+	while (ladev->dState.btMode) {
+		node = get_use_node(&bt_ustream);
+		if (node != NULL) {
+			write(ladev->oDevPrope.dev_fd, node->addr, node->size);
+			put_free_node(&bt_ustream, node);
+			if (bt_ustream.free_cnt == 1)
+				pthread_cond_signal(&ustream_rdy_sig);
+		} else {
+			pthread_mutex_lock(&ustream_rdy_lock);
+			if (bt_ustream.use_cnt <= 0)
+				pthread_cond_wait(&ustream_rdy_sig, &ustream_rdy_lock);
+			pthread_mutex_unlock(&ustream_rdy_lock);
+		}
+	}
+
+	return NULL;
+}
+
+static void bt_stream_init(struct xb47xx_audio_device *ladev)
+{
+	ADnode *node = NULL;
+	int i = 0;
+
+	if (bt_dstream.mem == NULL) {
+		bt_dstream.mem = (char *)calloc(1, 2*AD_STREAM_MEMSIZ);
+		if (!bt_dstream.mem) {
+			ALOGE(" calloc bt mem error! ");
+			return;
+		} else {
+			bt_ustream.mem = bt_dstream.mem + AD_STREAM_MEMSIZ;
+		}
+	}
+
+	list_init(&bt_dstream.free_node_list);
+	list_init(&bt_ustream.free_node_list);
+	list_init(&bt_dstream.use_node_list);
+	list_init(&bt_ustream.use_node_list);
+
+	for (i=0; i<3; i++) {
+		node = &bt_dstream.node[i];
+		node->addr = bt_dstream.mem + i * AD_NODE_BUFSIZ;
+		node->size = 0;
+		list_add(&node->list, &bt_dstream.free_node_list);
+	}
+
+	for (i=0; i<3; i++) {
+		node = &bt_ustream.node[i];
+		node->addr = bt_ustream.mem + i * AD_NODE_BUFSIZ;
+		node->size = 0;
+		list_add(&node->list, &bt_ustream.free_node_list);
+	}
+
+	bt_dstream.free_cnt = 3;
+	bt_ustream.free_cnt = 3;
+	bt_dstream.use_cnt = 0;
+	bt_ustream.use_cnt = 0;
+}
+
+static void bt_start_call(struct xb47xx_stream_out *out)
+{
+	struct xb47xx_audio_device *ladev = out->ladev;
+	int fd = out->outDevPrope->dev_fd;
+	uint32_t samplerate = 8000;
+	uint32_t channel = 1;
+	int ret = -ENODEV;
+	FUNC_ENTER();
+
+	bt_stream_init(ladev);
+
+	out->outDevPrope->btdev_fd = open(DSP1_DEVICE, O_WRONLY);
+	if (out->outDevPrope->btdev_fd <= 0) {
+		ALOGE("%s(line:%d): dsp1 open write audio device error ", __func__, __LINE__);
+		out->outDevPrope->btdev_fd = -1;
+		return;
+	}
+
+	if (ladev->iDevPrope.btdev_fd == -1) {
+		ladev->iDevPrope.btdev_fd = open(DSP1_DEVICE, O_RDONLY);
+		if (ladev->iDevPrope.btdev_fd <= 0) {
+			ALOGE("%s(line:%d): dsp1 open write audio device error ", __func__, __LINE__);
+			ladev->iDevPrope.btdev_fd = -1;
+			return;
+		}
+	}
+
+	ladev->iDevPrope.dev_fd = open(DSP_DEVICE, O_RDONLY);
+	if (ladev->iDevPrope.dev_fd <= 0) {
+		ALOGE("%s(line:%d): dsp1 open write audio device error ", __func__, __LINE__);
+		ladev->iDevPrope.dev_fd = -1;
+		return;
+	}
+
+	ret = ioctl(fd, SNDCTL_DSP_CHANNELS, &channel);
+	if (ret) {
+		ALOGV("DSP_CHANNELS fail (%s)\n",strerror(ret));
+	}
+	ret = ioctl(fd, SNDCTL_DSP_SPEED, &samplerate);
+	if (ret) {
+		ALOGV("DSP_SPEED fail (%s)\n",strerror(ret));
+	}
+
+	pthread_create(&bt_dev.dr_thread, NULL, dr_thread_func, ladev);
+	pthread_create(&bt_dev.ur_thread, NULL, ur_thread_func, ladev);
+	usleep(256000);
+	pthread_create(&bt_dev.dw_thread, NULL, dw_thread_func, ladev);
+	pthread_create(&bt_dev.uw_thread, NULL, uw_thread_func, ladev);
+}
+
+static void bt_end_call(struct xb47xx_stream_out *out)
+{
+	struct xb47xx_audio_device *ladev = out->ladev;
+	int fd = out->outDevPrope->dev_fd;
+	int btfd = -1;
+	uint32_t ret = 0;
+	uint32_t samplerate = 44100;
+	uint32_t channel = 2;
+	FUNC_ENTER();
+
+	pthread_cond_signal(&dstream_rdy_sig);
+	pthread_cond_signal(&ustream_rdy_sig);
+
+	if (ladev->iDevPrope.btdev_fd > 0) {
+                if (ioctl(ladev->iDevPrope.btdev_fd, SNDCTL_EXT_STOP_DMA, &ret) < 0)
+                        ALOGE("%s(line:%d): SNDCTL_EXT_PUT_ZNODE, fail", __func__, __LINE__);
+		pthread_join(bt_dev.ur_thread, NULL);
+		close(ladev->iDevPrope.btdev_fd);
+		ladev->iDevPrope.btdev_fd = -1;
+	}
+
+	if (ladev->iDevPrope.dev_fd > 0) {
+		pthread_join(bt_dev.dr_thread, NULL);
+		close(ladev->iDevPrope.dev_fd);
+		ladev->iDevPrope.dev_fd = -1;
+	}
+
+	if (out->outDevPrope->btdev_fd > 0) {
+                if (ioctl(out->outDevPrope->btdev_fd, SNDCTL_EXT_STOP_DMA, &ret) < 0)
+                        ALOGE("%s(line:%d): SNDCTL_EXT_PUT_ZNODE, fail", __func__, __LINE__);
+		pthread_join(bt_dev.dw_thread, NULL);
+		close(out->outDevPrope->btdev_fd);
+		out->outDevPrope->btdev_fd = -1;
+	}
+
+	if (out->outDevPrope->dev_fd > 0) {
+		ret = ioctl(fd, SNDCTL_DSP_CHANNELS, &channel);
+		if (ret) {
+			ALOGV("DSP_CHANNELS fail (%s)\n",strerror(ret));
+		}
+		ret = ioctl(fd, SNDCTL_DSP_SPEED, &samplerate);
+		if (ret) {
+			ALOGV("DSP_SPEED fail (%s)\n",strerror(ret));
+		}
+		pthread_join(bt_dev.uw_thread, NULL);
+	}
+
+	if (bt_dstream.mem != NULL)
+		memset(bt_dstream.mem, 0, 2*AD_STREAM_MEMSIZ);
+}
+
 static audio_devices_t  old_devices;
 
 static int out_set_device(struct audio_stream *stream, audio_devices_t device)
@@ -340,6 +735,7 @@ static int out_set_device(struct audio_stream *stream, audio_devices_t device)
 	struct xb47xx_audio_device *ladev = NULL;
 	int speaker_en = 0;
 	enum snd_device_t device_mode;
+	bool bt_on = false;
 
 	if (out == NULL)
 		return ret;
@@ -385,18 +781,23 @@ static int out_set_device(struct audio_stream *stream, audio_devices_t device)
 			device_mode = SND_DEVICE_HDMI;
 			break;
 		case AUDIO_DEVICE_OUT_WIRED_HEADSET|AUDIO_DEVICE_OUT_SPEAKER:
+			if (isInCall(ladev)) {
+				device_mode = SND_DEVICE_CALL_HEADPHONE;
+				break;
+			}
 		case AUDIO_DEVICE_OUT_WIRED_HEADPHONE|AUDIO_DEVICE_OUT_SPEAKER:
 			ALOGV("AUDIO_DEVICE_OUT_SPEAKER_AND_HEADSET");
-			if (isInCall(ladev))
-				device_mode = SND_DEVICE_HEADSET_DOWNLINK;
-			else
-				device_mode = SND_DEVICE_HEADSET_AND_SPEAKER;
+			if (isInCall(ladev)) {
+				device_mode = SND_DEVICE_CALL_HEADSET;
+				break;
+			}
+			device_mode = SND_DEVICE_HEADSET_AND_SPEAKER;
 			break;
 
 		case AUDIO_DEVICE_OUT_WIRED_HEADSET:
 			ALOGV("AUDIO_DEVICE_OUT_WIRED_HEADSET");
 			if (isInCall(ladev))
-				device_mode = SND_DEVICE_HEADSET_DOWNLINK;
+				device_mode = SND_DEVICE_CALL_HEADSET;
 			else
 				device_mode = SND_DEVICE_HEADSET;
 			break;
@@ -404,28 +805,42 @@ static int out_set_device(struct audio_stream *stream, audio_devices_t device)
 		case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
 			ALOGV("AUDIO_DEVICE_OUT_WIRED_HEADPHONE");
 			if (isInCall(ladev))
-				device_mode = SND_DEVICE_HEADPHONE_DOWNLINK;
+				device_mode = SND_DEVICE_CALL_HEADPHONE;
 			else
 				device_mode = SND_DEVICE_HEADPHONE;
 			break;
+
 		case AUDIO_DEVICE_OUT_EARPIECE:
 			ALOGV("AUDIO_DEVICE_OUT_EARPIECE");
 			if (isInCall(ladev)) {
-				device_mode = SND_DEVICE_HANDSET_DOWNLINK;
+				device_mode = SND_DEVICE_CALL_HANDSET;
 				break;
 			}
+          case AUDIO_DEVICE_OUT_ALL_SCO:
+              ALOGV("AUDIO_DEVICE_OUT_ALL_SCO");
+              if (isInCall(ladev)) {
+                  device_mode = SND_DEVICE_BT;
+                  bt_on = true;
+                  break;
+              }
 		case AUDIO_DEVICE_OUT_SPEAKER:
 			ALOGV("AUDIO_DEVICE_OUT_SPEAKER");
 		default :
 		case AUDIO_DEVICE_OUT_DEFAULT:
 			ALOGV("AUDIO_DEVICE_OUT_DEFAULT");
 			if (isInCall(ladev))
-				device_mode = SND_DEVICE_SPEAKER_DOWNLINK;
+				device_mode = SND_DEVICE_CALL_SPEAKER;
 			else
 				device_mode = SND_DEVICE_SPEAKER;
 			break;
 	}
-	if (out->outDevPrope->dev_fd != -1) {
+
+    if (ladev->dState.btMode && !bt_on) {
+        ladev->dState.btMode = false;
+        bt_end_call(out);
+    }
+
+    if (out->outDevPrope->dev_fd != -1) {
 		if ((ret = ioctl(out->outDevPrope->dev_fd, SNDCTL_EXT_SET_DEVICE, &device_mode)) < 0) {
 			ALOGE("%s(line:%d): set out device error", __func__, __LINE__);
 			ret = -errno;
@@ -435,6 +850,11 @@ static int out_set_device(struct audio_stream *stream, audio_devices_t device)
 			ALOGV("%s(line:%d): set out device %x success", __func__, __LINE__,out->outState.sState.devices);
 		}
 	}
+
+    if (bt_on && !ladev->dState.btMode) {
+        ladev->dState.btMode = true;
+        bt_start_call(out);
+    }
 
 	return ret;
 }
@@ -710,28 +1130,41 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
 {
 	/* write data to device */
 	int written = 0;
+	int count = bytes;
+	uint8_t* p = (uint8_t*)buffer;
 	struct xb47xx_stream_out *out = (struct xb47xx_stream_out *)stream;
+	struct xb47xx_audio_device *ladev = out->ladev;
+
+	if (ladev->dState.btMode) {
+		/* Ignore any write operations when bt calling. */
+		usleep(34000);
+		return bytes;
+	}
 
 	out_check_and_release_standby(&stream->common);
 
-	if (!out->outDevPrope->dev_mapdata_start) {
-		written = write(out->outDevPrope->dev_fd, buffer , bytes);
-	} else {
-		ALOGW("%s(line:%d): has been mapped, can not write here!\n",
-				__func__, __LINE__);
-		return -EIO;
+	while (count > 3) {
+		if (!out->outDevPrope->dev_mapdata_start) {
+			written = write(out->outDevPrope->dev_fd, p , count);
+		} else {
+			ALOGW("%s(line:%d): has been mapped, can not write here!\n",
+					__func__, __LINE__);
+			return -EIO;
+		}
+		count	-= written;
+		p	+= written;
 	}
 #ifdef DUMP_OUTPUT_DATA
 	{
 		if (debug_output_fd > 0) {
 			ALOGD("[dump] written = %d, debug_output_fd = %d", written, debug_output_fd);
-			if (write(debug_output_fd, buffer, written) != written) {
+			if (write(debug_output_fd, buffer , written) != written) {
 				ALOGE("[dump] write error !");
 			}
 		}
 	}
 #endif
-	return written;
+	return (bytes-count);
 }
 
 /**
@@ -765,7 +1198,7 @@ static uint32_t in_get_sample_rate(const struct audio_stream *stream)
 	struct xb47xx_stream_in *in = (struct xb47xx_stream_in *)stream;
 	if (in == NULL)
 		return -ENODEV;
-    return in->inState.sState.sampleRate;
+	return in->inState.sState.sampleRate;
 }
 
 /**
@@ -777,7 +1210,7 @@ static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 	FUNC_ENTER();
 
 	/* set sample rate */
-	int ret = -EIO;
+	int ret = -ENODEV;
 	uint32_t tmp_rate = rate;
 
 	struct xb47xx_stream_in *in = (struct xb47xx_stream_in *)stream;
@@ -785,10 +1218,15 @@ static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 		ALOGW("%s(line:%d): set in sample rate error, no device", __func__, __LINE__);
 		return ret;
 	}
+
 	if (in->inDevPrope->dev_fd != -1) {
 		if ((ret = set_device_samplerate(in->inDevPrope->dev_fd, &rate)) < 0) {
 			ALOGW("%s(line:%d): set in sample rate error", __func__, __LINE__);
 			return ret;
+		}
+		if (in->inState.sState.sampleRate != rate) {
+			in->inState.sState.bufferSize = reset_device_buffersize(in->inDevPrope->dev_fd,
+					rate);
 		}
 		in->inState.sState.sampleRate = rate;
 	} else
@@ -809,7 +1247,10 @@ static size_t in_get_buffer_size(const struct audio_stream *stream)
 
 	if (in == NULL)
 		return -ENODEV;
-	return in->inState.sState.bufferSize;
+	if (popcount(in->inState.sState.channels) == 2)
+		return in->inState.sState.bufferSize;
+	else
+		return in->inState.sState.bufferSize/2;
 }
 
 /**
@@ -903,7 +1344,6 @@ static int in_standby(struct audio_stream *stream)
  */
 static int in_check_and_release_standby(struct audio_stream *stream)
 {
-	//FUNC_ENTER();
 
 	/* set standby */
 #if 0
@@ -960,7 +1400,7 @@ static int in_set_device(struct audio_stream *stream, audio_devices_t device)
 		return ret;
 	in->inState.sState.inputSource;
 	ladev = in->ladev;
-
+	ALOGD("%s(line:%d): device = %x", __func__, __LINE__, device);
 	/* turn the device to kdevice, which the driver can be recognised */
 	if (device & AUDIO_DEVICE_IN_VOICE_CALL) {
 		kdevice = AUDIO_DEVICE_IN_VOICE_CALL;
@@ -996,27 +1436,27 @@ static int in_set_device(struct audio_stream *stream, audio_devices_t device)
 		return -EINVAL;
 	}
 
+	ALOGD("%s(line:%d): kdevice = %x", __func__, __LINE__, kdevice);
 	switch (kdevice) {
 		case AUDIO_DEVICE_IN_WIRED_HEADSET:
 			if (isInCall(ladev)) {
-				device_mode = SND_DEVICE_HEADSET_MIC_UPLINK;
-				//device_mode = SND_DEVICE_RECORD_INCALL;
+				device_mode = SND_DEVICE_HEADSET_RECORD_INCALL;
 			} else {
 				device_mode = SND_DEVICE_HEADSET_MIC;
 			}
 			break;
 		case AUDIO_DEVICE_IN_VOICE_CALL|AUDIO_DEVICE_IN_WIRED_HEADSET:
 			if (isInCall(ladev))
-				device_mode = SND_DEVICE_HEADSET_MIC_UPLINK;
+				device_mode = SND_DEVICE_HEADSET_RECORD_INCALL;
 		case AUDIO_DEVICE_IN_VOICE_CALL|AUDIO_DEVICE_IN_BUILTIN_MIC:
 			if (isInCall(ladev))
-				device_mode = SND_DEVICE_BUILDIN_MIC_UPLINK;
+				device_mode = SND_DEVICE_BUILDIN_RECORD_INCALL;
 		case AUDIO_DEVICE_IN_VOICE_CALL|AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET:
 		case AUDIO_DEVICE_IN_COMMUNICATION|AUDIO_DEVICE_IN_WIRED_HEADSET:
 		case AUDIO_DEVICE_IN_COMMUNICATION|AUDIO_DEVICE_IN_BUILTIN_MIC:
 		case AUDIO_DEVICE_IN_COMMUNICATION|AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET:
 			if (isInCall(ladev))
-				device_mode = SND_DEVICE_RECORD_INCALL;
+				device_mode = SND_DEVICE_BUILDIN_RECORD_INCALL;
 		case AUDIO_DEVICE_IN_VOICE_CALL:
 		case AUDIO_DEVICE_IN_COMMUNICATION:
 		case AUDIO_DEVICE_IN_AMBIENT:
@@ -1026,8 +1466,8 @@ static int in_set_device(struct audio_stream *stream, audio_devices_t device)
 		case AUDIO_DEVICE_IN_DEFAULT:
 		case AUDIO_DEVICE_IN_BUILTIN_MIC:
 			if (isInCall(ladev)) {
-				device_mode = SND_DEVICE_BUILDIN_MIC_UPLINK;
-				//device_mode = SND_DEVICE_RECORD_INCALL;
+				//device_mode = SND_DEVICE_BUILDIN_MIC_UPLINK;
+				device_mode = SND_DEVICE_BUILDIN_RECORD_INCALL;
 			} else {
 				device_mode = SND_DEVICE_BUILDIN_MIC;
 			}
@@ -1102,6 +1542,7 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
 					device = atoi(value);
 
 				ALOGV("in_set_parameters route %x",device);
+				ALOGD("%s(line:%d): device = %x", __func__, __LINE__, device);
 				if ((in_set_device(stream, device)) < 0) {
 					ALOGE("%s(line:%d): do routing error!\n", __func__, __LINE__);
 					return -EIO;
@@ -1143,7 +1584,7 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
 	free(kvpairs_t);
 	kvpairs_t = NULL;
 
-    return 0;
+	return 0;
 }
 
 /**
@@ -1151,7 +1592,7 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
  * for freeing the memory for it.
  */
 static char * in_get_parameters(const struct audio_stream *stream,
-                                const char *keys)
+		const char *keys)
 {
 	FUNC_ENTER();
 
@@ -1166,9 +1607,9 @@ static char * in_get_parameters(const struct audio_stream *stream,
 		return NULL;
 	keys_t = strdup(keys);
 
-    key = strtok(keys_t, ";");
-    while (key != NULL) {
-        if (strlen(key) != 0) {
+	key = strtok(keys_t, ";");
+	while (key != NULL) {
+		if (strlen(key) != 0) {
 			ALOGD("%s(line:%d): key = [%s]", __func__, __LINE__, key);
 			strcat(ret, key);
 			strcat(ret, "=");
@@ -1200,11 +1641,11 @@ static char * in_get_parameters(const struct audio_stream *stream,
 			} else {
 				ALOGE("%s(line:%d): unknow key", __func__, __LINE__);
 			}
-        } else {
-            ALOGE("%s(line:%d): empty key", __func__, __LINE__);
-        }
-        key = strtok(NULL, ";");
-    }
+		} else {
+			ALOGE("%s(line:%d): empty key", __func__, __LINE__);
+		}
+		key = strtok(NULL, ";");
+	}
 
 	free(keys_t);
 
@@ -1213,7 +1654,7 @@ static char * in_get_parameters(const struct audio_stream *stream,
 
 	ALOGD("%s(line:%d): ret = [%s]", __func__, __LINE__, ret);
 
-    return strdup(ret);
+	return strdup(ret);
 }
 
 static int in_add_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
@@ -1224,7 +1665,7 @@ static int in_add_audio_effect(const struct audio_stream *stream, effect_handle_
 
 	if (in == NULL)
 		return -ENODEV;
-    return 0;
+	return 0;
 }
 
 static int in_remove_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
@@ -1235,12 +1676,12 @@ static int in_remove_audio_effect(const struct audio_stream *stream, effect_hand
 
 	if (in == NULL)
 		return -ENODEV;
-    return 0;
+	return 0;
 }
 
 /***************************\
  * struct audio_stream_in
-\***************************/
+ \***************************/
 /**
  * set the input gain for the audio driver. This method is
  * for future use
@@ -1258,11 +1699,11 @@ static int in_set_gain(struct audio_stream_in *stream, float gain)
 		return -ENODEV;
 	if (gain < 0.0) {
 		ALOGW("%s(line:%d): set in gain (%f) under 0.0, assuming 0.0",
-			 __func__, __LINE__, gain);
+				__func__, __LINE__, gain);
 		gain = 0.0;
 	} else if (gain > 1.0) {
 		ALOGW("%s(line:%d): set in gain (%f) over 1.0, assuming 1.0",
-			 __func__, __LINE__, gain);
+				__func__, __LINE__, gain);
 		gain = 1.0;
 	}
 
@@ -1293,8 +1734,13 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
 	if (in == NULL)
 		return -ENODEV;
 	in_check_and_release_standby(&stream->common);
+	ALOGV("count %d",bytes);
 
-	count = bytes;
+	if (bytes%2 != 0)
+		count = bytes -1;
+	else
+		count = bytes;
+
 	while (count) {
 		bytesRead = read(in->inDevPrope->dev_fd, p, count);
 		if (bytesRead < 0) {
@@ -1307,7 +1753,10 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
 		p += bytesRead;
 	}
 
-	return bytes;
+	if (bytes%2 !=0)
+		return bytes - 1;
+	else
+		return bytes;
 }
 
 /**
@@ -1328,12 +1777,12 @@ static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
 
 	if (in == NULL)
 		return -ENODEV;
-    return in->inState.framesLost;
+	return in->inState.framesLost;
 }
 
 /* #################################################################### *\
-|* struct audio_hw_device
-\* #################################################################### */
+   |* struct audio_hw_device
+   \* #################################################################### */
 
 /**
  * used by audio flinger to enumerate what devices are supported by
@@ -1383,44 +1832,44 @@ static int adev_init_check(const struct audio_hw_device *dev)
 /**
  * get volume methord of device, return the methord for ioctl
  */
-static int adev_get_device_volume_methord(struct audio_hw_device *dev,
-										  audio_devices_t device)
+static unsigned long adev_get_device_volume_methord(struct audio_hw_device *dev,
+		audio_devices_t device)
 {
 	FUNC_ENTER();
 
-	int volumeMethord = -1;
+	unsigned long  volumeMethord = 0;
 	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
 	switch (device) {
-	case AUDIO_DEVICE_OUT_EARPIECE:
-	case AUDIO_DEVICE_OUT_SPEAKER:
-	case AUDIO_DEVICE_OUT_WIRED_HEADSET:
-	case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
-	case AUDIO_DEVICE_OUT_BLUETOOTH_SCO:
-	case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
-	case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
-	case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP:
-	case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
-	case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
-	case AUDIO_DEVICE_OUT_AUX_DIGITAL:
-	case AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET:
-	case AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET:
-	case AUDIO_DEVICE_OUT_DEFAULT:
-		volumeMethord = SOUND_MIXER_WRITE_VOLUME;
-		break;
-	case AUDIO_DEVICE_IN_COMMUNICATION:
-	case AUDIO_DEVICE_IN_AMBIENT:
-	case AUDIO_DEVICE_IN_BUILTIN_MIC:
-    case AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET:
-    case AUDIO_DEVICE_IN_WIRED_HEADSET:
-    case AUDIO_DEVICE_IN_AUX_DIGITAL:
-    case AUDIO_DEVICE_IN_VOICE_CALL:
-    case AUDIO_DEVICE_IN_BACK_MIC:
-    case AUDIO_DEVICE_IN_DEFAULT:
-		volumeMethord = SOUND_MIXER_WRITE_MIC;
-		break;
-	default:
-		ALOGE("%s(line:%d): unknown device!", __func__, __LINE__);
+		case AUDIO_DEVICE_OUT_EARPIECE:
+		case AUDIO_DEVICE_OUT_SPEAKER:
+		case AUDIO_DEVICE_OUT_WIRED_HEADSET:
+		case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
+		case AUDIO_DEVICE_OUT_BLUETOOTH_SCO:
+		case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
+		case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
+		case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP:
+		case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+		case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
+		case AUDIO_DEVICE_OUT_AUX_DIGITAL:
+		case AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET:
+		case AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET:
+		case AUDIO_DEVICE_OUT_DEFAULT:
+			volumeMethord = SOUND_MIXER_WRITE_VOLUME;
+			break;
+		case AUDIO_DEVICE_IN_COMMUNICATION:
+		case AUDIO_DEVICE_IN_AMBIENT:
+		case AUDIO_DEVICE_IN_BUILTIN_MIC:
+		case AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET:
+		case AUDIO_DEVICE_IN_WIRED_HEADSET:
+		case AUDIO_DEVICE_IN_AUX_DIGITAL:
+		case AUDIO_DEVICE_IN_VOICE_CALL:
+		case AUDIO_DEVICE_IN_BACK_MIC:
+		case AUDIO_DEVICE_IN_DEFAULT:
+			volumeMethord = SOUND_MIXER_WRITE_MIC;
+			break;
+		default:
+			ALOGE("%s(line:%d): unknown device!", __func__, __LINE__);
 	}
 
 	return volumeMethord;
@@ -1434,27 +1883,32 @@ static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
 	FUNC_ENTER();
 
 	int vol = -1;
-	int volumeMethord = -1;
+	unsigned long volumeMethord = 0;
+	int ret = 0;
 	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
 	if (volume < 0.0) {
 		ALOGW("%s(line:%d): volume (%f) under 0.0, assuming 0.0\n",
-			 __func__, __LINE__, volume);
+				__func__, __LINE__, volume);
 		volume = 0.0;
 	} else if (volume > 1.0) {
 		ALOGW("%s(line:%d): volume (%f) over 1.0, assuming 1.0\n",
-			 __func__, __LINE__, volume);
+				__func__, __LINE__, volume);
 		volume = 1.0;
 	}
 
 	vol = ceil(volume * 100.0);
 
 	/* AUDIO_DEVICE_IN_COMMUNICATION */
-	volumeMethord = adev_get_device_volume_methord(dev, AUDIO_DEVICE_IN_COMMUNICATION);
-	if (volumeMethord >= 0) {
+//	volumeMethord = adev_get_device_volume_methord(dev, AUDIO_DEVICE_IN_COMMUNICATION);
+	if (isInCall(ladev)) {
+		volumeMethord = adev_get_device_volume_methord(dev,AUDIO_DEVICE_OUT_EARPIECE);
 		/* NOTE, we do not set hardware vomlue */
-		//if (ioctl(fd, volumeMethord, &vol) < 0)
-		//ALOGW("%s(line:%d): set volume error", __func__, __LINE__);
+		if(volumeMethord == SOUND_MIXER_WRITE_VOLUME){
+			ret = ioctl(ladev->oDevPrope.dev_fd,SNDCTL_EXT_SET_REPLAY_VOLUME,&vol);
+			if(ret < 0)
+				ALOGE("%s(line:%d): set volume error", __func__, __LINE__);
+		}
 	}
 
 	return 0;
@@ -1475,11 +1929,11 @@ static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
 
 	if (volume < 0.0) {
 		ALOGW("%s(line:%d): volume (%f) under 0.0, assuming 0.0\n",
-			 __func__, __LINE__, volume);
+				__func__, __LINE__, volume);
 		volume = 0.0;
 	} else if (volume > 1.0) {
 		ALOGW("%s(line:%d): volume (%f) over 1.0, assuming 1.0\n",
-			 __func__, __LINE__, volume);
+				__func__, __LINE__, volume);
 		volume = 1.0;
 	}
 
@@ -1514,11 +1968,11 @@ static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
 	}
 
 	/*
-	  We return an error code here to let the audioflinger do in-software
-	  volume on top of the maximum volume that we set through the SND API.
-	  return error - software mixer will handle it
-	*/
-    return -ENOSYS;
+	   We return an error code here to let the audioflinger do in-software
+	   volume on top of the maximum volume that we set through the SND API.
+	   return error - software mixer will handle it
+	   */
+	return -ENOSYS;
 }
 
 /**
@@ -1530,32 +1984,35 @@ static int adev_set_mode(struct audio_hw_device *dev, int mode)
 {
 	FUNC_ENTER();
 
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	ALOGV("%s, ladev[%x], old.%d-> new.%d", __func__, ladev, ladev->dState.adevMode, mode);
 
 	switch (mode) {
-	case AUDIO_MODE_INVALID:
-		ladev->dState.adevMode = AUDIO_MODE_INVALID;
-		break;
-	case AUDIO_MODE_CURRENT:
-		ladev->dState.adevMode = AUDIO_MODE_CURRENT;
-		break;
-	case AUDIO_MODE_NORMAL:
-		ladev->dState.adevMode = AUDIO_MODE_NORMAL;
-		break;
-	case AUDIO_MODE_RINGTONE:
-		ladev->dState.adevMode = AUDIO_MODE_RINGTONE;
-		break;
-	case AUDIO_MODE_IN_CALL:
-		ladev->dState.adevMode = AUDIO_MODE_IN_CALL;
-		break;
-	case AUDIO_MODE_IN_COMMUNICATION:
-		ladev->dState.adevMode = AUDIO_MODE_IN_COMMUNICATION;
-		break;
-	default:
-		ALOGE("%s(line:%d): unknown audio mode!", __func__, __LINE__);
+		case AUDIO_MODE_INVALID:
+			ladev->dState.adevMode = AUDIO_MODE_INVALID;
+			break;
+		case AUDIO_MODE_CURRENT:
+			ladev->dState.adevMode = AUDIO_MODE_CURRENT;
+			break;
+		case AUDIO_MODE_NORMAL:
+			ladev->dState.adevMode = AUDIO_MODE_NORMAL;
+			break;
+		case AUDIO_MODE_RINGTONE:
+			ladev->dState.adevMode = AUDIO_MODE_RINGTONE;
+			break;
+		case AUDIO_MODE_IN_CALL:
+			ladev->dState.adevMode = AUDIO_MODE_IN_CALL;
+			ALOGV("come into IN CALL mode\n");
+			break;
+		case AUDIO_MODE_IN_COMMUNICATION:
+			ladev->dState.adevMode = AUDIO_MODE_IN_COMMUNICATION;
+			ALOGV("come into IN COMMUNICATION mode\n");
+			break;
+		default:
+			ALOGE("%s(line:%d): unknown audio mode!", __func__, __LINE__);
 	}
 
-    return 0;
+	return 0;
 }
 
 /**
@@ -1565,11 +2022,11 @@ static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
 {
 	FUNC_ENTER();
 
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
 	ladev->dState.micMute = state;
 
-    return 0;
+	return 0;
 }
 
 /**
@@ -1579,9 +2036,9 @@ static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
 {
 	FUNC_ENTER();
 
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
-
-    return ladev->dState.micMute;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	*state = ladev->dState.micMute;
+    return *state;
 }
 
 /**
@@ -1593,7 +2050,7 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 
 	char *kvpairs_t;
 	char *pair;
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 	struct xb47xx_stream_out *out = ladev->ostream;
 	struct xb47xx_stream_in *in = ladev->istream;
 	int ret = -ENOSYS;
@@ -1602,23 +2059,23 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 
 	kvpairs_t = strdup(kvpairs);
 
-    pair = strtok(kvpairs_t, ";");
-    while (pair != NULL) {
-        if (strlen(pair) != 0) {
-            char *key;
-            char *value;
+	pair = strtok(kvpairs_t, ";");
+	while (pair != NULL) {
+		if (strlen(pair) != 0) {
+			char *key;
+			char *value;
 			uint32_t device;
-            size_t eqIdx;
+			size_t eqIdx;
 
 			/* get key and value */
 			eqIdx = strcspn(pair, "=");
 
 			key = pair;
-            if (eqIdx == strlen(pair)) {
-                value = NULL;
-            } else {
-                value = (pair + eqIdx + 1);
-            }
+			if (eqIdx == strlen(pair)) {
+				value = NULL;
+			} else {
+				value = (pair + eqIdx + 1);
+			}
 			*(key + eqIdx) = '\0';
 
 			ALOGD("%s(line:%d): key = [%s], value = [%s]", __func__, __LINE__, key, value);
@@ -1650,11 +2107,11 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 
 			} else
 				ALOGE("%s(line:%d): unknow key", __func__, __LINE__);
-        } else {
-           ALOGE("%s(line:%d): empty key value pair", __func__, __LINE__);
-        }
-        pair = strtok(NULL, ";");
-    }
+		} else {
+			ALOGE("%s(line:%d): empty key value pair", __func__, __LINE__);
+		}
+		pair = strtok(NULL, ";");
+	}
 
 	free(kvpairs_t);
 
@@ -1667,22 +2124,22 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
  * for freeing the memory for it.
  */
 static char * adev_get_parameters(const struct audio_hw_device *dev,
-                                  const char *keys)
+		const char *keys)
 {
 	FUNC_ENTER();
 
 	char *keys_t;
 	char *key;
 	char ret[100] = "\0";
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
 	ALOGD("%s(line:%d): keys = [%s]", __func__, __LINE__, keys);
 
 	keys_t = strdup(keys);
 
-    key = strtok(keys_t, ";");
-    while (key != NULL) {
-        if (strlen(key) != 0) {
+	key = strtok(keys_t, ";");
+	while (key != NULL) {
+		if (strlen(key) != 0) {
 			ALOGD("%s(line:%d): key = [%s]", __func__, __LINE__, key);
 			strcat(ret, key);
 			strcat(ret, "=");
@@ -1693,11 +2150,11 @@ static char * adev_get_parameters(const struct audio_hw_device *dev,
 			} else {
 				ALOGE("%s(line:%d): unknow key", __func__, __LINE__);
 			}
-        } else {
-            ALOGE("%s(line:%d): empty key", __func__, __LINE__);
-        }
-        key = strtok(NULL, ";");
-    }
+		} else {
+			ALOGE("%s(line:%d): empty key", __func__, __LINE__);
+		}
+		key = strtok(NULL, ";");
+	}
 
 	free(keys_t);
 
@@ -1706,8 +2163,8 @@ static char * adev_get_parameters(const struct audio_hw_device *dev,
 
 	ALOGD("%s(line:%d): ret = [%s]", __func__, __LINE__, ret);
 
-    //return strdup(ret);
-    return NULL;
+	//return strdup(ret);
+	return NULL;
 }
 
 /**
@@ -1715,40 +2172,50 @@ static char * adev_get_parameters(const struct audio_hw_device *dev,
  * 0 if one of the parameters is not supported
  */
 static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
-                                         const struct audio_config *config)
+		const struct audio_config *config)
 {
 	FUNC_ENTER();
 
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
 	/* get record buffer size */
-		uint32_t i = 0;
-		const uint32_t inputSamplingRates[] = {
-			8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
-		};
+	uint32_t i = 0;
+	int div = 0;
+	const uint32_t inputSamplingRates[] = {
+		8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
+	};
 
-		int channel_count = popcount(config->channel_mask);
+	int channel_count = popcount(config->channel_mask);
 
-		for (i = 0; i < sizeof(inputSamplingRates) / sizeof(uint32_t); i++) {
-			if (config->sample_rate == inputSamplingRates[i]) {
-				break;
-			}
+	for (i = 0; i < sizeof(inputSamplingRates) / sizeof(uint32_t); i++) {
+		if (config->sample_rate == inputSamplingRates[i]) {
+			break;
 		}
+	}
 
-		if ( i >= sizeof(inputSamplingRates) / sizeof(uint32_t)) {
-			ALOGW("%s(line:%d): bad sampling rate: %d", __func__, __LINE__, config->sample_rate);
-			return 0;
-		}
-		if (config->format != AUDIO_FORMAT_PCM_16_BIT) {
-			ALOGW("%s(line:%d): bad format: %d", __func__, __LINE__, config->format);
-			return 0;
-		}
-		if (channel_count < 1 || channel_count > 2) {
-			ALOGW("%s(line:%d): bad channel count: %d", __func__, __LINE__, channel_count);
-			return 0;
-		}
+	if ( i >= sizeof(inputSamplingRates) / sizeof(uint32_t)) {
+		ALOGW("%s(line:%d): bad sampling rate: %d", __func__, __LINE__, config->sample_rate);
+		return 0;
+	}
+	if (config->format != AUDIO_FORMAT_PCM_16_BIT) {
+		ALOGW("%s(line:%d): bad format: %d", __func__, __LINE__, config->format);
+		//audio_bytes_per_sample();
+		return 0;
+	}
+	if (channel_count < 1 || channel_count > 2) {
+		ALOGW("%s(line:%d): bad channel count: %d", __func__, __LINE__, channel_count);
+		return 0;
+	}
+	if (channel_count == 1)
+		div = 2;
+	else
+		div = 1;
 
-		return (AUDIO_HW_IN_DEF_BUFFERSIZE / sizeof(short)) * channel_count;
+	if (!ladev->istream)
+		return AUDIO_HW_IN_DEF_BUFFERSIZE/sizeof(short)/div;
+	if (!ladev->istream->inState.sState.bufferSize)
+		ladev->istream->inState.sState.bufferSize = AUDIO_HW_IN_DEF_BUFFERSIZE;
+	return (ladev->istream->inState.sState.bufferSize / sizeof(short)) /div;
 
 }
 
@@ -1756,44 +2223,44 @@ static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
  * open output device
  */
 static uint32_t adev_open_output_device(struct audio_hw_device *dev) {
-		/* open device */
-		int map_size = 0;
-		int status = -1;
-		struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	/* open device */
+	int map_size = 0;
+	int status = -1;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
-		FUNC_ENTER();
-		ladev->oDevPrope.dev_fd = open(DSP_DEVICE, O_WRONLY);
-		if (ladev->oDevPrope.dev_fd <= 0) {
+	FUNC_ENTER();
+	ladev->oDevPrope.dev_fd = open(DSP_DEVICE, O_WRONLY);
+	if (ladev->oDevPrope.dev_fd <= 0) {
 		status = -errno;
 		ALOGE("%s(line:%d): open write audio device error %d", __func__, __LINE__,status);
-			ladev->oDevPrope.dev_fd = -1;
+		ladev->oDevPrope.dev_fd = -1;
 		return status;
-		}
+	}
 #ifdef MAP_OUTPUT_DEV
-		status = ioctl(ladev->oDevPrope.dev_fd, SNDCTL_DSP_GETBLKSIZE, &map_size);
-		if (!status) {
-			if(map_size) {
-				ladev->oDevPrope.dev_map_fd = open(DSP_DEVICE, O_RDWR);
-				if (ladev->oDevPrope.dev_map_fd < 0) {
-					ALOGE("%s(line:%d): can not mmap!", __func__, __LINE__);
-				} else {
-					ladev->oDevPrope.dev_mapdata_start =
-						(unsigned char *)mmap(NULL,
-											  map_size,
-											  PROT_WRITE,
-											  MAP_SHARED,
-											  ladev->oDevPrope.dev_map_fd,
-											  0);
-					ALOGV("%s(line:%d): mapdata_start = %p size = %d",
-						 __func__, __LINE__, ladev->oDevPrope.dev_mapdata_start, map_size);
-				}
+	status = ioctl(ladev->oDevPrope.dev_fd, SNDCTL_DSP_GETBLKSIZE, &map_size);
+	if (!status) {
+		if(map_size) {
+			ladev->oDevPrope.dev_map_fd = open(DSP_DEVICE, O_RDWR);
+			if (ladev->oDevPrope.dev_map_fd < 0) {
+				ALOGE("%s(line:%d): can not mmap!", __func__, __LINE__);
+			} else {
+				ladev->oDevPrope.dev_mapdata_start =
+					(unsigned char *)mmap(NULL,
+							map_size,
+							PROT_WRITE,
+							MAP_SHARED,
+							ladev->oDevPrope.dev_map_fd,
+							0);
+				ALOGV("%s(line:%d): mapdata_start = %p size = %d",
+						__func__, __LINE__, ladev->oDevPrope.dev_mapdata_start, map_size);
 			}
-		} else {
-			ALOGE("%s(line:%d): IOCTL SNDCTL_DSP_GETBLKSIZE return error %d\n",
-				 __func__, __LINE__, status);
 		}
+	} else {
+		ALOGE("%s(line:%d): IOCTL SNDCTL_DSP_GETBLKSIZE return error %d\n",
+				__func__, __LINE__, status);
+	}
 #endif
-		return 0;
+	return 0;
 }
 
 /**
@@ -1801,7 +2268,7 @@ static uint32_t adev_open_output_device(struct audio_hw_device *dev) {
  */
 static void adev_close_output_device(struct audio_hw_device *dev)
 {
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 
 	if (ladev->oDevPrope.dev_map_fd != -1) {
 		close(ladev->oDevPrope.dev_map_fd);
@@ -1816,17 +2283,17 @@ static void adev_close_output_device(struct audio_hw_device *dev)
  * This method creates and opens the audio hardware output stream
  */
 static int adev_open_output_stream(struct audio_hw_device *dev,
-								   audio_io_handle_t handle,
-                                   audio_devices_t devices,
-								   audio_output_flags_t flags,
-								   struct audio_config *config,
-                                   struct audio_stream_out **stream_out)
+		audio_io_handle_t handle,
+		audio_devices_t devices,
+		audio_output_flags_t flags,
+		struct audio_config *config,
+		struct audio_stream_out **stream_out)
 {
 	FUNC_ENTER();
 
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
-    struct xb47xx_stream_out *out;
-    int ret;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_stream_out *out;
+	int ret;
 	uint32_t mchannels = -1;
 	int mformat = -1;
 	int need_open_dev;
@@ -1836,9 +2303,9 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 		return -ENOSYS;
 	}
 
-    out = (struct xb47xx_stream_out *)calloc(1, sizeof(struct xb47xx_stream_out));
-    if (!out)
-        return -ENOMEM;
+	out = (struct xb47xx_stream_out *)calloc(1, sizeof(struct xb47xx_stream_out));
+	if (!out)
+		return -ENOMEM;
 
 	ladev->ostream = out;
 	if (config->channel_mask == 0)
@@ -1858,7 +2325,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 
 	out->outState.sState.bufferSize = AUDIO_HW_OUT_DEF_BUFFERSIZE;
 	out->outState.sState.standby = false;
-		out->outState.sState.devices = AUDIO_DEVICE_OUT_DEFAULT;
+	out->outState.sState.devices = AUDIO_DEVICE_OUT_DEFAULT;
 	out->outState.lVolume = 1.0;
 	out->outState.rVolume = 1.0;
 	out->outState.renderPosition = 0;
@@ -1890,24 +2357,24 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 		goto err_open;
 	}
 
-    out->stream.common.get_sample_rate = out_get_sample_rate;
-    out->stream.common.set_sample_rate = out_set_sample_rate;
-    out->stream.common.get_buffer_size = out_get_buffer_size;
-    out->stream.common.get_channels = out_get_channels;
-    out->stream.common.get_format = out_get_format;
-    out->stream.common.set_format = out_set_format;
-    out->stream.common.standby = out_standby;
-    out->stream.common.dump = out_dump;
+	out->stream.common.get_sample_rate = out_get_sample_rate;
+	out->stream.common.set_sample_rate = out_set_sample_rate;
+	out->stream.common.get_buffer_size = out_get_buffer_size;
+	out->stream.common.get_channels = out_get_channels;
+	out->stream.common.get_format = out_get_format;
+	out->stream.common.set_format = out_set_format;
+	out->stream.common.standby = out_standby;
+	out->stream.common.dump = out_dump;
 	out->stream.common.get_device = out_get_device;
 	out->stream.common.set_device = out_set_device;
-    out->stream.common.set_parameters = out_set_parameters;
-    out->stream.common.get_parameters = out_get_parameters;
-    out->stream.common.add_audio_effect = out_add_audio_effect;
-    out->stream.common.remove_audio_effect = out_remove_audio_effect;
-    out->stream.get_latency = out_get_latency;
-    out->stream.set_volume = out_set_volume;
-    out->stream.write = out_write;
-    out->stream.get_render_position = out_get_render_position;
+	out->stream.common.set_parameters = out_set_parameters;
+	out->stream.common.get_parameters = out_get_parameters;
+	out->stream.common.add_audio_effect = out_add_audio_effect;
+	out->stream.common.remove_audio_effect = out_remove_audio_effect;
+	out->stream.get_latency = out_get_latency;
+	out->stream.set_volume = out_set_volume;
+	out->stream.write = out_write;
+	out->stream.get_render_position = out_get_render_position;
 	*stream_out = &out->stream;
 #ifdef DUMP_OUTPUT_DATA
 	if ((debug_output_fd = open(DUMP_OUTPUT_FILE, O_WRONLY | O_CREAT | O_APPEND)) <= 0) {
@@ -1915,13 +2382,13 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 	}
 #endif
 
-    return 0;
+	return 0;
 
 err_open:
 	adev_close_output_device(&ladev->device);
-    free(out);
+	free(out);
 	out = NULL;
-    *stream_out = NULL;
+	*stream_out = NULL;
 	ladev->ostream = NULL;
 	return ret;
 }
@@ -1930,15 +2397,15 @@ err_open:
  * close output stream
  */
 static void adev_close_output_stream(struct audio_hw_device *dev,
-                                     struct audio_stream_out *stream)
+		struct audio_stream_out *stream)
 {
 	FUNC_ENTER();
 
-    struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 	struct xb47xx_stream_out *out = (struct xb47xx_stream_out *)stream;
 
 	if (ladev) {
-	adev_close_output_device(dev);
+		adev_close_output_device(dev);
 		if (ladev->ostream != NULL)
 			if (ladev->ostream != out) {
 				ALOGD("BUG: close_output_stream is error ,one device is used two or more stream");
@@ -1947,7 +2414,6 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
 		ladev->ostream = NULL;
 	} else
 		ALOGW("There is no device on this input stream");
-
 
 #ifdef DUMP_OUTPUT_DATA
 	if (debug_output_fd > 0) {
@@ -1975,7 +2441,7 @@ static uint32_t adev_open_input_device(struct audio_hw_device *dev)
 		ALOGE("%s(line:%d): open read audio device error %d", __func__, __LINE__,status);
 		ladev->iDevPrope.dev_fd = -1;
 		return status;
-				}
+	}
 
 	return 0;
 }
@@ -1997,10 +2463,10 @@ static void adev_close_input_device(struct audio_hw_device *dev)
  * This method creates and opens the audio hardware input stream
  */
 static int adev_open_input_stream(struct audio_hw_device *dev,
-								  audio_io_handle_t handle,
-								  audio_devices_t devices,
-								  struct audio_config *config,
-                                  struct audio_stream_in **stream_in)
+		audio_io_handle_t handle,
+		audio_devices_t devices,
+		struct audio_config *config,
+		struct audio_stream_in **stream_in)
 {
 	FUNC_ENTER();
 
@@ -2009,17 +2475,19 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
 	int ret;
 	uint32_t mchannels = -1;
 	int mformat = -1;
-
-	if (ladev->istream != NULL) {
-		ALOGW("Xb47xx audio HW HAL input stream is only support open one time");
-		return -ENOSYS;
-	}
-
+	uint32_t buffersize;
+	/*if (ladev->istream != NULL) {
+	  usleep(2000000);
+	  ALOGW("Xb47xx audio HW HAL input stream is only support open one time");
+	  return -ENOSYS;
+	  }
+	*/
 	in = (struct xb47xx_stream_in *)calloc(1, sizeof(struct xb47xx_stream_in));
 	if (!in)
-		return -ENOMEM;
+	  return -ENOMEM;
 
-	ladev->istream = in;
+	//ladev->istream = in;
+
 	if (config->format)
 		in->inState.sState.format = config->format;
 	else
@@ -2034,16 +2502,24 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
 		in->inState.sState.channels = config->channel_mask = AUDIO_HW_IN_DEF_CHANNELS;
 	in->inState.sState.bufferSize = AUDIO_HW_IN_DEF_BUFFERSIZE;
 	in->inState.sState.standby = false;
-		in->inState.sState.devices = AUDIO_DEVICE_IN_BUILTIN_MIC;
+	in->inState.sState.devices = AUDIO_DEVICE_IN_BUILTIN_MIC;
 	in->inState.gain = 1.0;
 	in->inState.framesLost = 0;
 	in->ladev = ladev;
 
 	/* record */
-	ret = adev_open_input_device(&ladev->device);
-	if (ret)
-		goto err_open;
-
+	/*
+	  ret = adev_open_input_device(&ladev->device);
+	  if (ret)
+	  goto err_open;
+	*/
+	if (ladev->istream == NULL)
+	  {
+	    ret = adev_open_input_device(&ladev->device);
+	    if (ret)
+	      goto err_open;
+	  }
+	ladev->istream = in;
 	in->inDevPrope = &ladev->iDevPrope;
 
 	ret = set_device_channels(ladev->iDevPrope.dev_fd,&config->channel_mask,STREAM_IN);
@@ -2064,39 +2540,41 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
 		in->inState.sState.format = 0;
 		goto err_open;
 	}
+	in->inState.sState.bufferSize = reset_device_buffersize(in->inDevPrope->dev_fd,
+			in->inState.sState.sampleRate);
 
 	in->stream.common.get_sample_rate = in_get_sample_rate;
 	in->stream.common.set_sample_rate = in_set_sample_rate;
-    in->stream.common.get_buffer_size = in_get_buffer_size;
-    in->stream.common.get_channels = in_get_channels;
-    in->stream.common.get_format = in_get_format;
-    in->stream.common.set_format = in_set_format;
-    in->stream.common.standby =	in_standby;
-    in->stream.common.dump = in_dump;
+	in->stream.common.get_buffer_size = in_get_buffer_size;
+	in->stream.common.get_channels = in_get_channels;
+	in->stream.common.get_format = in_get_format;
+	in->stream.common.set_format = in_set_format;
+	in->stream.common.standby =	in_standby;
+	in->stream.common.dump = in_dump;
 	in->stream.common.get_device = in_get_device;
 	in->stream.common.set_device = in_set_device;
-    in->stream.common.set_parameters = in_set_parameters;
-    in->stream.common.get_parameters = in_get_parameters;
-    in->stream.common.add_audio_effect = in_add_audio_effect;
-    in->stream.common.remove_audio_effect = in_remove_audio_effect;
-    in->stream.set_gain = in_set_gain;
-    in->stream.read = in_read;
-    in->stream.get_input_frames_lost = in_get_input_frames_lost;
+	in->stream.common.set_parameters = in_set_parameters;
+	in->stream.common.get_parameters = in_get_parameters;
+	in->stream.common.add_audio_effect = in_add_audio_effect;
+	in->stream.common.remove_audio_effect = in_remove_audio_effect;
+	in->stream.set_gain = in_set_gain;
+	in->stream.read = in_read;
+	in->stream.get_input_frames_lost = in_get_input_frames_lost;
 
-    *stream_in = &in->stream;
+	*stream_in = &in->stream;
 #ifdef DUMP_INPUT_DATA
 	/* open */
 	if ((debug_input_fd = open(DUMP_INPUT_FILE, O_WRONLY | O_APPEND)) <= 0) {
 		ALOGE("[dump] open file error !");
 	}
 #endif
-    return 0;
+	return 0;
 
 err_open:
 	adev_close_input_device(&ladev->device);
-    free(in);
+	free(in);
 	in = NULL;
-    *stream_in = NULL;
+	*stream_in = NULL;
 	ladev->istream = NULL;
 	return ret;
 }
@@ -2111,13 +2589,14 @@ static void adev_close_input_stream(struct audio_hw_device *dev,
 	struct xb47xx_stream_in *in = (struct xb47xx_stream_in *)stream;
 	struct xb47xx_audio_device *ladev = (struct xb47xx_audio_device *)dev;
 	if (ladev) {
-	adev_close_input_device(dev);
-		if (ladev->istream)
+		if (ladev->istream) {
 			if (ladev->istream != in) {
 				ALOGD("BUG: close_input_stream is error ,one device is used two or more stream");
-				free(ladev->istream);
+			} else {
+				adev_close_input_device(dev);
+				ladev->istream = NULL;
 			}
-		ladev->istream = NULL;
+		}
 	} else
 		ALOGW("There is no device on this input stream");
 
@@ -2137,19 +2616,19 @@ static int adev_dump(const audio_hw_device_t *device, int fd)
 {
 	FUNC_ENTER();
 
-    return 0;
+	return 0;
 }
 
 /* #################################################################### *\
-|* module open & close
-\* #################################################################### */
+   |* module open & close
+   \* #################################################################### */
 
 static int adev_close(hw_device_t *device)
 {
 	FUNC_ENTER();
 
 	struct audio_hw_device *dev = (struct audio_hw_device *)device;
-    struct xb47xx_audio_device *adev = (struct xb47xx_audio_device *)dev;
+	struct xb47xx_audio_device *adev = (struct xb47xx_audio_device *)dev;
 	/* close hw device for playback and record */
 	if (adev == NULL) {
 		ALOGW("adev_close : device is already closed before");
@@ -2163,79 +2642,83 @@ static int adev_close(hw_device_t *device)
 		free(adev->ostream);
 	if (adev->istream)
 		free(adev->istream);
-    free(adev);
+	free(adev);
 	adev = NULL;
 
-    return 0;
+	return 0;
 }
 
 static int adev_open(const hw_module_t* module, const char* name,
-                     hw_device_t** device)
+		hw_device_t** device)
 {
-    struct xb47xx_audio_device *adev;
-    int ret;
+	struct xb47xx_audio_device *adev;
+	int ret;
 
 	FUNC_ENTER();
 
-    if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
-        return -EINVAL;
+	if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
+		return -EINVAL;
 
-    adev = calloc(1, sizeof(struct xb47xx_audio_device));
-    if (!adev)
-        return -ENOMEM;
+	adev = calloc(1, sizeof(struct xb47xx_audio_device));
+	if (!adev)
+		return -ENOMEM;
 
 	adev->dState.adevMode = AUDIO_MODE_NORMAL;
 	adev->dState.micMute = false;
+	adev->dState.btMode = false;
 
-    adev->device.common.tag = HARDWARE_DEVICE_TAG;
-    adev->device.common.version = AUDIO_DEVICE_API_VERSION_CURRENT;
-    adev->device.common.module = (struct hw_module_t *) module;
-    adev->device.common.close = adev_close;
+	adev->device.common.tag = HARDWARE_DEVICE_TAG;
+	adev->device.common.version = AUDIO_DEVICE_API_VERSION_CURRENT;
+	adev->device.common.module = (struct hw_module_t *) module;
+	adev->device.common.close = adev_close;
 
-    adev->device.get_supported_devices = adev_get_supported_devices;
-    adev->device.init_check = adev_init_check;
-    adev->device.set_voice_volume = adev_set_voice_volume;
-    adev->device.set_master_volume = adev_set_master_volume;
-    adev->device.set_mode = adev_set_mode;
-    adev->device.set_mic_mute = adev_set_mic_mute;
-    adev->device.get_mic_mute = adev_get_mic_mute;
-    adev->device.set_parameters = adev_set_parameters;
-    adev->device.get_parameters = adev_get_parameters;
-    adev->device.get_input_buffer_size = adev_get_input_buffer_size;
-    adev->device.open_output_stream = adev_open_output_stream;
-    adev->device.close_output_stream = adev_close_output_stream;
-    adev->device.open_input_stream = adev_open_input_stream;
-    adev->device.close_input_stream = adev_close_input_stream;
-    adev->device.dump = adev_dump;
+	adev->device.get_supported_devices = adev_get_supported_devices;
+	adev->device.init_check = adev_init_check;
+	adev->device.set_voice_volume = adev_set_voice_volume;
+	adev->device.set_master_volume = adev_set_master_volume;
+	adev->device.set_mode = adev_set_mode;
+	adev->device.set_mic_mute = adev_set_mic_mute;
+	adev->device.get_mic_mute = adev_get_mic_mute;
+	adev->device.set_parameters = adev_set_parameters;
+	adev->device.get_parameters = adev_get_parameters;
+	adev->device.get_input_buffer_size = adev_get_input_buffer_size;
+	adev->device.open_output_stream = adev_open_output_stream;
+	adev->device.close_output_stream = adev_close_output_stream;
+	adev->device.open_input_stream = adev_open_input_stream;
+	adev->device.close_input_stream = adev_close_input_stream;
+	adev->device.dump = adev_dump;
 
 	adev->oDevPrope.dev_fd = -1;
 	adev->oDevPrope.dev_map_fd = -1;
 	adev->oDevPrope.dev_mapdata_start = NULL;
 
 	adev->iDevPrope.dev_fd = -1;
-
+	adev->oDevPrope.btdev_fd = -1;
+	adev->iDevPrope.btdev_fd = -1;
 
 	//adev_open_input_device(&adev->device);
 	//adev_open_output_device(&adev->device);
 	/* open hw device for playback and record */
-    *device = &adev->device.common;
+	*device = &adev->device.common;
+
+	bt_stream_init(adev);
 
 	FUNC_LEAVE();
-    return 0;
+	return 0;
 }
 
 static struct hw_module_methods_t hal_module_methods = {
-    .open = adev_open,
+	.open = adev_open,
 };
 
 struct audio_module HAL_MODULE_INFO_SYM = {
-    .common = {
-        .tag = HARDWARE_MODULE_TAG,
-        .version_major = 1,
-        .version_minor = 0,
-        .id = AUDIO_HARDWARE_MODULE_ID,
-        .name = "Xb47xx audio HW HAL",
-        .author = "The Android Open Source Project",
-        .methods = &hal_module_methods,
-    },
+	.common = {
+		.tag = HARDWARE_MODULE_TAG,
+		.version_major = 1,
+		.version_minor = 0,
+		.id = AUDIO_HARDWARE_MODULE_ID,
+		.name = "Ingenic audio HW HAL",
+		.author = "The Android Open Source Project",
+		.methods = &hal_module_methods,
+	},
 };
