@@ -12,7 +12,7 @@
 
 #define LOG_TAG "CameraColorConvert"
 //#define LOG_NDEBUG 0
-//#define COMPLIE_SUPPORT_MIPS_FOR_JZ
+#define COMPLIE_SUPPORT_MIPS_FOR_JZ
 #include "CameraColorConvert.h"
 
 #define CLIP(value) (uint8_t)(((value)>0xFF)?0xff:(((value)<0)?0:(value)))
@@ -242,7 +242,7 @@ namespace android {
     void CameraColorConvert::cimvyuy_to_tile420(uint8_t* src_data,int srcwidth, int srcheight,
                                                 uint8_t* dest,int start_mbrow, int mbrow_nums) {
 #ifdef COMPLIE_SUPPORT_MIPS_FOR_JZ
-            cimvyuy_to_tile420_use_hardware(src_data,src_width,srcheight,
+            cimvyuy_to_tile420_use_hardware(src_data,srcwidth,srcheight,
                     dest,start_mbrow,mbrow_nums);
 #else
             cimvyuy_to_tile420_use_soft(src_data,srcwidth,srcheight,

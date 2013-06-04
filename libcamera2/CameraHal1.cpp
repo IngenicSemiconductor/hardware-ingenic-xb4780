@@ -17,6 +17,8 @@
 #include "CameraHalSelector.h"
 #include "CameraFaceDetect.h"
 
+#define ENCODE_BY_HARDWARE
+
 #ifndef PIXEL_FORMAT_YV16
 #define PIXEL_FORMAT_YV16  0x36315659 /* YCrCb 4:2:2 Planar */
 #endif

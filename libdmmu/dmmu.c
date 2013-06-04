@@ -124,6 +124,7 @@ int dmmu_get_page_table_base_phys(unsigned int *phys_addr)
 {
 	int ret = 0;
 	ENTER();
+        dmmu_init();
 
 	if (phys_addr == NULL) {
 		ALOGD("phys_addr is NULL!\n");
@@ -150,7 +151,8 @@ int dmmu_map_user_mem(void * vaddr, int size)
 {
 	ENTER();
 	int i;
-
+        dmmu_init();
+        
 	if (dmmu_fd < 0) {
 		ALOGD("dmmu_fd < 0");
 		return -1;
@@ -179,6 +181,7 @@ int dmmu_map_user_mem(void * vaddr, int size)
 int dmmu_unmap_user_mem(void * vaddr, int size)
 {
 	ENTER();
+        dmmu_init();
 
 	if (dmmu_fd < 0) {
 		ALOGD("dmmu_fd < 0");
@@ -203,7 +206,8 @@ int dmmu_get_memory_physical_address(struct dmmu_mem_info * mem)
 {
 	ENTER();
 	int i;
-
+        dmmu_init();
+        
 	if (dmmu_fd < 0) {
 		ALOGD("dmmu_fd < 0");
 		return -1;
@@ -257,12 +261,14 @@ int dmmu_release_memory_physical_address(struct dmmu_mem_info* mem)
 /* NOTE: page_start and page_end maybe used both by two buffer. */
 int dmmu_map_user_memory(struct dmmu_mem_info* mem)
 {
+    dmmu_init();
   return dmmu_map_user_mem(mem->vaddr, mem->size);
 }
 
 /* NOTE: page_start and page_end maybe used both by two buffer. */
 int dmmu_unmap_user_memory(struct dmmu_mem_info* mem)
 {
+    dmmu_init();
   return dmmu_unmap_user_mem(mem->vaddr, mem->size);
 }
 
