@@ -150,6 +150,7 @@ namespace android {
     private:
 
         mutable Mutex mlock;
+        mutable Mutex mlock_recording;
         int mcamera_id;
         bool mirror;
         CameraDeviceCommon* mDevice;

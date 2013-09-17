@@ -12,15 +12,12 @@
 
 #define LOG_TAG "CameraColorConvert"
 //#define LOG_NDEBUG 0
-#define COMPLIE_SUPPORT_MIPS_FOR_JZ
 #include "CameraColorConvert.h"
+#include <jzsoc/jzmedia.h>
 
 #define CLIP(value) (uint8_t)(((value)>0xFF)?0xff:(((value)<0)?0:(value)))
-#ifdef COMPLIE_SUPPORT_MIPS_FOR_JZ
-#include <jzsoc/jzmedia.h>
 #define i_pref(hint,base,offset)        \
 ({ __asm__ __volatile__("pref %0,%2(%1)"::"i"(hint),"r"(base),"i"(offset):"memory");})
-#endif
 
 namespace android {
 
@@ -134,9 +131,8 @@ namespace android {
         }
     }
 
-    void CameraColorConvert::cimvyuy_to_tile420_use_hardware(uint8_t* src_data,int srcwidth, int srcheight,
+    void CameraColorConvert::cimvyuy_to_tile420(uint8_t* src_data,int srcwidth, int srcheight,
                                                 uint8_t* dest,int start_mbrow, int mbrow_nums) {
-#ifdef  COMPLIE_SUPPORT_MIPS_FOR_JZ
 
         if (src_data == 0) {
             ALOGE("%s: data is null",__FUNCTION__);
@@ -228,27 +224,7 @@ namespace android {
             }
             src += 15*2*width;//src proceed to next mbrow
         }
-#endif
     }
-
-    void CameraColorConvert::cimvyuy_to_tile420_use_soft(uint8_t* src_data,int srcwidth, int srcheight,
-                                                uint8_t* dest,int start_mbrow, int mbrow_nums) {
-        if (src_data != NULL) {
-            memcpy(dest, src_data, srcwidth*srcheight*12/8);
-        }
-        return;
-    }
-
-    void CameraColorConvert::cimvyuy_to_tile420(uint8_t* src_data,int srcwidth, int srcheight,
-                                                uint8_t* dest,int start_mbrow, int mbrow_nums) {
-#ifdef COMPLIE_SUPPORT_MIPS_FOR_JZ
-            cimvyuy_to_tile420_use_hardware(src_data,srcwidth,srcheight,
-                    dest,start_mbrow,mbrow_nums);
-#else
-            cimvyuy_to_tile420_use_soft(src_data,srcwidth,srcheight,
-                    dest,start_mbrow,mbrow_nums);
-#endif
-   }
 
     void CameraColorConvert::cimyuv420b_to_tile420(CameraYUVMeta* yuvMeta) {
 

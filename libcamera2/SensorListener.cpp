@@ -186,8 +186,8 @@ namespace android {
     }
 
     int SensorListener::getDefaultDisplayRotation(void) {
-        //        int rotation = SurfaceComposerClient::getDisplayOrientation(DisplayID(0));
-        int rotation = ROTATION_0;
+	//forest_gun
+        int rotation = ROTATION_0;//SurfaceComposerClient::getDisplayOrientation(DisplayID(0));
         switch (rotation) {
         case ROTATION_0:
             return 0;

@@ -10,7 +10,6 @@
  * published by the Free Software Foundation.
  */
 
-
 #ifndef ANDROID_HARDWARE_CAMERAJZPARAMETERS_HARDWARE_H
 #define ANDROID_HARDWARE_CAMERAJZPARAMETERS_HARDWARE_H
 
@@ -42,9 +41,6 @@ namespace android {
         static const char KEY_LUMA_ADAPTATION[]; 
         static const char KEY_NIGHTSHOT_MODE[];
         static const char KEY_ORIENTATION[];
-
-        static const char PIXEL_FORMAT_JZ__YUV420T[]; // ingenic yuv420tile
-        static const char PIXEL_FORMAT_JZ__YUV420P[]; // ingenic yuv420p
 
         static const int num_wb;
         static const mode_map_t wb_map[];

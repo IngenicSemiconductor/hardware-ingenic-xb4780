@@ -17,11 +17,9 @@
 
 namespace android {
 
-     const char JZCameraParameters::KEY_LUMA_ADAPTATION[] = "luma-adaptation"; 
-     const char JZCameraParameters::KEY_NIGHTSHOT_MODE[]  = "nightshot-mode";
-     const char JZCameraParameters::KEY_ORIENTATION[]     = "orientation";
-     const char JZCameraParameters::PIXEL_FORMAT_JZ__YUV420T[] = "jzyuv420t"; // ingenic yuv420tile
-     const char JZCameraParameters::PIXEL_FORMAT_JZ__YUV420P[] = "jzyuv420p"; // ingenic yuv420p
+    const char JZCameraParameters::KEY_LUMA_ADAPTATION[] = "luma-adaptation"; 
+    const char JZCameraParameters::KEY_NIGHTSHOT_MODE[]  = "nightshot-mode";
+    const char JZCameraParameters::KEY_ORIENTATION[]     = "orientation";
 
     const int JZCameraParameters::num_wb = 8;
     const mode_map_t JZCameraParameters::wb_map[] = {
@@ -101,8 +99,6 @@ namespace android {
         { CameraParameters::PIXEL_FORMAT_YUV420SP, PIXEL_FORMAT_YUV420SP},
         { CameraParameters::PIXEL_FORMAT_YUV422SP, PIXEL_FORMAT_YUV422SP},
         { CameraParameters::PIXEL_FORMAT_YUV420P,  PIXEL_FORMAT_YUV420P},
-        { JZCameraParameters::PIXEL_FORMAT_JZ__YUV420T, PIXEL_FORMAT_JZ_YUV420T},
-        { JZCameraParameters::PIXEL_FORMAT_JZ__YUV420P, PIXEL_FORMAT_JZ_YUV420P}
     };
 
     JZCameraParameters::JZCameraParameters(CameraDeviceCommon* cdc, int id)
@@ -190,11 +186,7 @@ namespace android {
     void JZCameraParameters::setPreviewFormat(int* previewformat, const char* valstr) {
 
         ALOGV("%s: set preview format: %s",__FUNCTION__, valstr);
-        if (strcmp(valstr, JZCameraParameters::PIXEL_FORMAT_JZ__YUV420T) == 0) {
-            *previewformat = PIXEL_FORMAT_JZ_YUV420T;
-        } else {
-            *previewformat = PIXEL_FORMAT_YUV422I;
-        }
+        *previewformat = PIXEL_FORMAT_YUV422I;
     }
 
     int JZCameraParameters::setParameters(String8 params) {
@@ -849,13 +841,10 @@ namespace android {
 
         char preview_formats[1024];
         memset(preview_formats, 0, 1024);
-        snprintf(preview_formats, sizeof(preview_formats), "%s,%s,%s,%s,%s,%s",
+        snprintf(preview_formats, sizeof(preview_formats), "%s,%s,%s",
                  CameraParameters::PIXEL_FORMAT_YUV422I,
                  CameraParameters::PIXEL_FORMAT_YUV420SP,
-                 CameraParameters::PIXEL_FORMAT_YUV422SP,
-                 CameraParameters::PIXEL_FORMAT_YUV420P,
-                 JZCameraParameters::PIXEL_FORMAT_JZ__YUV420T,
-                 JZCameraParameters::PIXEL_FORMAT_JZ__YUV420P);
+                 CameraParameters::PIXEL_FORMAT_YUV420P);
         mParameters.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS, preview_formats);
 
         mParameters.setPreviewFormat(CameraParameters::PIXEL_FORMAT_YUV420SP);
@@ -1084,7 +1073,7 @@ namespace android {
         mParameters.setVideoSize(preferred_width,preferred_height);
         snprintf(tmp_preview_for_video, 20,"%dx%d",preferred_width, preferred_height);
         //mParameters.set(CameraParameters::KEY_PREFERRED_PREVIEW_SIZE_FOR_VIDEO,
-        //      tmp_preview_for_video);
+        //     tmp_preview_for_video);
 
         ALOGV("(%d) init preview size: %s", mCameraId, "640x480");
         ALOGV("(%d) init picture size: %s", mCameraId, "640x480");

@@ -33,11 +33,6 @@ namespace android {
         void cimvyuy_to_tile420(uint8_t* src_data,int srcwidth, int srcheight,
                                 uint8_t* dest,int start_mbrow, int mbrow_nums);
 
-        void cimvyuy_to_tile420_use_soft(uint8_t* src_data,int srcwidth, int srcheight,
-                                                uint8_t* dest,int start_mbrow, int mbrow_nums); 
-        void cimvyuy_to_tile420_use_hardware(uint8_t* src_data,int srcwidth, int srcheight,
-                                                uint8_t* dest,int start_mbrow, int mbrow_nums);
- 
 
         void tile420_to_rgb565(CameraYUVMeta* yuvMeta, uint8_t* dst);
 
