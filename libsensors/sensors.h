@@ -63,14 +63,9 @@ struct sensors_platform_data {
 			struct sensors_emenation_t *plate_data;
 			void *plate; // 个别设备需要传递的参数.
 };
-#define SENSOR_TYPE_ACCELEROMETER       1
-#define SENSOR_TYPE_MAGNETIC_FIELD      2
-#define SENSOR_TYPE_ORIENTATION         3
-#define SENSOR_TYPE_GYROSCOPE           4
-#define SENSOR_TYPE_LIGHT               5
-#define SENSOR_TYPE_PRESSURE            6
-#define SENSOR_TYPE_TEMPERATURE         7
-#define SENSOR_TYPE_PROXIMITY           8
+
+// Sensor types are defined in hardware/libhardware/include/hardware/sensors.h
+
 /*
 	define it for all sensor interface .
 	you can add a interface here.

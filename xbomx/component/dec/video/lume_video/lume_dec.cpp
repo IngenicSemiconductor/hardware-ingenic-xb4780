@@ -16,6 +16,8 @@
  * -------------------------------------------------------------------
  */
 
+#define LOG_TAG "lume_dec"
+
 #include <utils/threads.h>
 //#include "lume_phymem.h"
 #include "avcodec.h"
@@ -50,7 +52,6 @@ static unsigned int GetTimer(void){
 
 #include <LUMEDefs.h>
 
-#define LOG_TAG "lume_dec"
 #include <utils/Log.h>
 #define EL(x,y...) //{ALOGE("%s %d",__FILE__,__LINE__); LOGE(x,##y);}
 
