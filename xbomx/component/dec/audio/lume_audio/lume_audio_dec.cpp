@@ -16,6 +16,9 @@
  * -------------------------------------------------------------------
  */
 
+
+#define LOG_TAG "lume_audio_dec"
+
 #include <utils/threads.h>
 #include <utils/String8.h>
 #include <LUMEDefs.h>
@@ -30,7 +33,6 @@
 #include "pcm_decoder.h"
 #include "dvdpcm_decoder.h"
 
-#define LOG_TAG "lume_audio_dec"
 #include <utils/Log.h>
 
 #define EL_P1(x,y...) //ALOGE(x,##y);

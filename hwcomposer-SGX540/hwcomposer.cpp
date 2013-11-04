@@ -11,6 +11,8 @@
 #include <linux/fb.h>
 #include <sys/mman.h>
 
+#define LOG_TAG "HWC-JZX2D"
+
 #include <cutils/properties.h>
 #include <cutils/log.h>
 #include <cutils/native_handle.h>
@@ -50,8 +52,6 @@
 #undef LOGD
 #define LOGD //
 #endif
-
-#define LOG_TAG "HWC-JZX2D"
 
 //#define SUPPORT_GLOBAL_ALPHA
 

@@ -87,6 +87,9 @@
 #define HAVE_ALLOCA_H 1
 #undef HAVE_ALSA_ASOUNDLIB_H
 #define HAVE_ALTIVEC_H 0
+#ifdef ANDROID
+#undef HAVE_MALLOC_H
+#endif
 #define HAVE_MALLOC_H 1
 #define HAVE_SYS_MMAN_H 1
 
@@ -173,6 +176,7 @@
 #define ARCH_ARM 0
 #undef ARCH_MIPS
 #define ARCH_MIPS 1
+#define ARCH_MIPS64 0
 #define ARCH_PA_RISC 0
 #define ARCH_S390 0
 #define ARCH_S390X 0
@@ -205,6 +209,7 @@
 #define HAVE_MMI 0
 #define HAVE_VIS 0
 #define HAVE_MVI 0
+#define HAVE_LOONGSON 0
 
 
 /* Blu-ray/DVD/VCD/CD */
@@ -550,6 +555,9 @@
 #define CONFIG_NETWORK 1
 #define CONFIG_PIC 0
 #define HAVE_POSIX_MEMALIGN 0
+#ifdef ANDROID
+#undef HAVE_PTHREADS
+#endif
 #define HAVE_PTHREADS 1
 #define HAVE_ROUND 1
 #define HAVE_ROUNDF 1
